@@ -6,6 +6,41 @@ It demonstrates a **Bronze–Silver–Gold (BSG) pipeline using Dynamic Tables**
 
 ---
 
+## Quick Start
+
+Prerequisites: a ClickZetta Lakehouse account and `cz-cli` installed.
+
+```bash
+git clone https://github.com/clickzetta/snowflake2lakehouse-dynamic-tables.git
+cd snowflake2lakehouse-dynamic-tables
+
+# Create a cz-cli profile (run once)
+cz-cli profile create bsg_dt \
+  --service   <your-region>.api.clickzetta.com \
+  --instance  <your-instance-id> \
+  --workspace <your-workspace> \
+  --schema    bsg_dynamic_tables \
+  --vcluster  default \
+  --username  <your-username> \
+  --password  <your-password>
+
+# Run the pipeline (order matters)
+cz-cli sql -f 03_lakehouse/00_orders_staging.sql --profile bsg_dt --sync --write
+cz-cli sql -f 03_lakehouse/01_bronze_dynamic_table.sql --profile bsg_dt --sync --write
+cz-cli sql -f 03_lakehouse/02_silver_dynamic_table.sql --profile bsg_dt --sync --write
+cz-cli sql -f 03_lakehouse/03_gold_dynamic_table.sql --profile bsg_dt --sync --write
+
+# Trigger an initial refresh (Dynamic Tables don't auto-refresh until the first interval)
+cz-cli sql "REFRESH DYNAMIC TABLE bsg_dynamic_tables.bronze_orders" --profile bsg_dt --sync --write
+cz-cli sql "REFRESH DYNAMIC TABLE bsg_dynamic_tables.silver_orders" --profile bsg_dt --sync --write
+cz-cli sql "REFRESH DYNAMIC TABLE bsg_dynamic_tables.gold_sales_summary" --profile bsg_dt --sync --write
+
+# Clean up all objects when done
+cz-cli sql -f 03_lakehouse/06_cleanup.sql --profile bsg_dt --sync --write
+```
+
+---
+
 ## Migration Summary
 
 | Concept | Snowflake | Lakehouse |
@@ -85,8 +120,3 @@ Snowflake allows `DATA_RETENTION_TIME_IN_DAYS` as an inline DDL option on `CREAT
 
 ---
 
-## Related Documentation
-
-- [动态表（Dynamic Table）](https://docs.clickzetta.com/dynamic-table)
-- [CREATE DYNAMIC TABLE](https://docs.clickzetta.com/create-dynamic-table)
-- [Time Travel](https://docs.clickzetta.com/timetravel)
