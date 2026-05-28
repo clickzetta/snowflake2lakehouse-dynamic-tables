@@ -1,167 +1,92 @@
-# Snowflake BSG (Dynamic Tables)
+# Snowflake → Lakehouse: Dynamic Tables Migration (BSG Architecture)
 
-## 1. Project Overview
+This repository is a migration of [Techy-Malay/snowflake-bsg-dynamic-tables](https://github.com/Techy-Malay/snowflake-bsg-dynamic-tables) from Snowflake to [ClickZetta Lakehouse](https://www.clickzetta.com).
 
-This project demonstrates a **Snowflake-native implementation of the Bronze–Silver–Gold (BSG) architecture using Dynamic Tables**.
-
-The focus of this repository is **architecture and platform design**, not operational pipeline implementation. It is intentionally structured to explain **how and why** Dynamic Tables should be used to design clean, maintainable BSG layers in Snowflake.
+It demonstrates a **Bronze–Silver–Gold (BSG) pipeline using Dynamic Tables**, and serves as a concrete reference for teams migrating Snowflake Dynamic Table workloads to Lakehouse.
 
 ---
 
-## 2. Project Intent & Context
+## Migration Summary
 
-This repository is **deliberately different** from my earlier Dynamic Tables project.
-
-* **Earlier project**: Focused on building a **production-ready data engineering pipeline**, including end-to-end execution and operational aspects such as notifications and monitoring.
-
-* **This project**: Focuses on **platform and architectural design** — how to correctly structure Bronze–Silver–Gold layers using Snowflake Dynamic Tables, define responsibility boundaries, and rely on Snowflake’s execution model rather than custom or user-managed orchestration.
-
-The intent here is to demonstrate **design judgment**, specifically:
-
-* When *not* to add operational complexity
-* How to keep responsibilities clean across Bronze, Silver, and Gold layers
-* How Dynamic Tables change the way BSG pipelines are reasoned about
-
-The SQL included in this repository is **intentionally minimal and illustrative**. It exists to clarify layer intent, not to represent a full production pipeline.
-
-Together, these two projects represent **complementary perspectives**:
-
-* Building and operating data pipelines
-* Designing data platforms with long-term correctness and maintainability in mind
+| Concept | Snowflake | Lakehouse |
+|---------|-----------|-----------|
+| Sample dataset | `SNOWFLAKE_SAMPLE_DATA.TPCH_SF1.ORDERS` | `clickzetta_sample_data.tpch_100g.orders` |
+| Compute resource | `WAREHOUSE = compute_wh` | `VCLUSTER default` |
+| Refresh cadence | `TARGET_LAG = '5 minutes'` | `REFRESH INTERVAL '5' MINUTE` |
+| Dependency model | `TARGET_LAG = 'DOWNSTREAM'` (auto-cascade) | No DOWNSTREAM concept; each table refreshes on its own interval |
+| Time Travel retention | `DATA_RETENTION_TIME_IN_DAYS = 1` (inline DDL) | `ALTER TABLE ... SET PROPERTIES ('data_retention_days' = '1')` |
+| Manual refresh | `ALTER DYNAMIC TABLE ... REFRESH` | `REFRESH DYNAMIC TABLE ...` |
+| Deduplication | `QUALIFY ROW_NUMBER() OVER (...) = 1` | Same syntax — fully supported |
+| Date truncation | `DATE_TRUNC('day', ts)` | Same syntax — fully supported |
+| Schema reference | `USE SCHEMA` + unqualified table names | Fully-qualified names (`schema.table`) |
 
 ---
 
-## 3. Architecture Overview
+## Architecture
 
-![Snowflake BSG Architecture using Dynamic Tables](architecture/bsg-dynamic-tables-architecture.png)
-
-The pipeline follows a linear, dependency-driven flow:
-
-**Source → Bronze Dynamic Table → Silver Dynamic Table → Gold Dynamic Table**
-
-Key architectural characteristics:
-
-* Each layer is implemented as a Dynamic Table
-* Refresh is dependency-based, not schedule-driven
-* No Tasks or Streams are used
-* Warehouses are assigned deliberately to balance cost and performance
-
-This architecture emphasizes **clarity, traceability, and operational simplicity** over complexity.
-
-Dynamic Tables are used to allow Snowflake to manage refresh order and incremental processing.
-The platform automatically maintains dependencies across Bronze, Silver, and Gold layers without user-managed orchestration.
-
-
----
-
-## 4. Implementation Outline
-[File structure list]
-
-The SQL implementation for this project is organized as follows:
-
-```text
-sql/
-├── 00_orders_staging.sql        # Stage sample data with Time Travel enabled
-├── 01_bronze_dynamic_table.sql  # Bronze layer: raw but governed
-├── 02_silver_dynamic_table.sql  # Silver layer: cleansed and deduplicated
-└── 03_gold_dynamic_table.sql    # Gold layer: business-ready aggregates
+```
+clickzetta_sample_data.tpch_100g.orders  (shared dataset, 150M rows)
+              │
+              ▼
+bsg_dynamic_tables.orders_stg            (staging table, CTAS, Time Travel enabled)
+              │
+              ▼  REFRESH INTERVAL '5' MINUTE
+bsg_dynamic_tables.bronze_orders         (raw + lineage metadata)
+              │
+              ▼  REFRESH INTERVAL '5' MINUTE  +  QUALIFY dedup
+bsg_dynamic_tables.silver_orders         (cleansed, deduplicated)
+              │
+              ▼  REFRESH INTERVAL '10' MINUTE
+bsg_dynamic_tables.gold_sales_summary    (daily aggregates, business-ready)
 ```
 
+---
+
+## File Structure
+
+```
+sql/
+├── 00_orders_staging.sql        # Create staging table from shared TPCH dataset
+├── 01_bronze_dynamic_table.sql  # Bronze layer: raw but governed
+├── 02_silver_dynamic_table.sql  # Silver layer: cleansed and deduplicated
+└── 03_gold_dynamic_table.sql    # Gold layer: business-ready daily aggregates
+```
+
+Each file contains inline migration notes explaining every syntax change.
 
 ---
 
+## Verified Results
 
-## 5. Bronze Layer — Raw but Governed
+All SQL was verified against a live Lakehouse instance using `cz-cli`:
 
-The Bronze layer represents raw data ingestion with governance.
-
-Design principles:
-
-* Data is ingested in its original granularity
-* Schema is enforced to avoid ambiguity
-* Ingestion timestamps and source metadata are captured
-* Transformations are intentionally minimal
-
-Bronze is designed to be **reproducible and traceable**, not a dumping ground.
+| Table | Rows | Notes |
+|-------|------|-------|
+| `orders_stg` | 100,000 | Sampled from 150M-row TPCH dataset |
+| `bronze_orders` | 100,000 | + `ingestion_ts`, `source_system` columns |
+| `silver_orders` | 100,000 | QUALIFY dedup — no duplicates in TPCH source |
+| `gold_sales_summary` | 103 | 103 distinct order dates, total sales $15.1B |
 
 ---
 
-## 6. Silver Layer — Cleaned and Standardized
+## Key Differences to Note
 
-The Silver layer focuses on data correctness and consistency.
+**No DOWNSTREAM dependency model**
 
-Responsibilities include:
+Snowflake's `TARGET_LAG = 'DOWNSTREAM'` lets upstream tables trigger downstream refreshes automatically. Lakehouse does not have this concept — each Dynamic Table refreshes on its own fixed interval. In practice, set Tier 1 intervals shorter than Tier 2/3 to approximate the cascade behavior.
 
-* Deduplication
-* Standardization of formats and data types
-* Basic data quality validation
+**REFRESH command syntax**
 
-What is explicitly avoided:
+Snowflake uses `ALTER DYNAMIC TABLE <name> REFRESH`. Lakehouse uses `REFRESH DYNAMIC TABLE <name>`. Both trigger an immediate out-of-schedule refresh.
 
-* Complex joins
-* Business rules
-* Aggregations
+**Data retention is a table property**
 
-This separation keeps reprocessing fast and debugging manageable.
+Snowflake allows `DATA_RETENTION_TIME_IN_DAYS` as an inline DDL option on `CREATE TABLE`. In Lakehouse, this is set post-creation via `ALTER TABLE ... SET PROPERTIES ('data_retention_days' = 'N')`.
 
 ---
 
-## 7. Gold Layer — Business-Ready Analytics
+## Related Documentation
 
-The Gold layer serves analytical and reporting workloads.
-
-Characteristics:
-
-* Aggregated and query-optimized tables
-* Stable schemas designed for consumption
-* Clear alignment with business metrics
-
-Gold tables are designed so that **consumers do not need to bypass them**.
-
----
-
-## 8. Refresh Strategy & Execution Model
-
-Dynamic Tables refresh based on declared freshness and upstream dependencies.
-
-Key points:
-
-* Downstream tables refresh automatically when upstream data changes
-* Execution order is handled by Snowflake
-* Orchestration logic is removed from user-managed code
-
-This reduces operational complexity and improves reliability.
-
----
-
-## 9. Key Design Decisions
-
-* Dynamic Tables were chosen over Tasks and Streams for simplicity and maintainability
-* Transformations are minimized in early layers to keep reprocessing cheap
-* Gold tables are intentionally opinionated and business-focused
-* Cost and performance trade-offs are evaluated per layer
-
----
-
-## 10. What This Project Demonstrates
-
-* Snowflake Dynamic Tables
-* Medallion (BSG) architecture principles
-* Data engineering best practices
-* Cost-aware pipeline design
-* Architect-level decision making
-
----
-
-## 11. Author
-
-**Malaya Padhi** *(pronounced: Malay)*
-Principal Architect (Aspirational) | Snowflake • Data Architecture • Data Engineering
-
-This project reflects hands-on architectural thinking around Snowflake Dynamic Tables, Medallion Architecture, and production-oriented data pipeline design, with a clear progression toward Principal Architect–level responsibilities.
-
----
-
-## 12. References & Notes
-
-This project is conceptually aligned with common industry discussions on Medallion Architecture and demonstrates a **Snowflake-specific implementation using Dynamic Tables**.
+- [动态表（Dynamic Table）](https://docs.clickzetta.com/dynamic-table)
+- [CREATE DYNAMIC TABLE](https://docs.clickzetta.com/create-dynamic-table)
+- [Time Travel](https://docs.clickzetta.com/timetravel)
